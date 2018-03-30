@@ -5,3 +5,4 @@ Module.symvers
 *.cmd
 *.mod.c
 .tmp_versions
+dirtyc0w
