@@ -30,8 +30,8 @@ sudo dpkg -i *.deb
 You may need to modify your GRUB config to select this kernel version
 at boot. Use `uname -r` to check your running kernel version.
 
-## Install Apache Tomcat and Struts
-
+For the remote code execution to work, you also need to install Apache
+Struts. We are using CVE-2017-5638 (yes, the same one that pwned Equifax).
 Download [Tomcat](http://apache.mirrors.tds.net/tomcat/tomcat-8/v8.5.30/bin/apache-tomcat-8.5.30.tar.gz) and untar it anywhere convenient. Download [Struts 2.5.10](https://archive.apache.org/dist/struts/2.5.10/struts-2.5.10-all.zip) and uncompress it.
 Install Struts 2 by copying the REST example to webapps directory (`$CATALINA_HOME$` being the root directory of Tomcat, `$STRUTS$` being the Struts 2 directory):
 
@@ -39,3 +39,11 @@ Install Struts 2 by copying the REST example to webapps directory (`$CATALINA_HO
 cp $STRUTS$/apps/struts2-rest-showcase.war $CATALINA_HOME$/webapps/ROOT.war
 sudo $CATALINA_HOME$/bin/startup.sh
 ```
+
+## Exploit (attacker host)
+
+To remotely install the rootkit, run `./struts2.py <hostname of target>`.
+
+If you want to install the rootkit locally (without root), run `make install`.
+
+If you are already root, you can simply run `make && sudo insmod rootkit.ko`.
