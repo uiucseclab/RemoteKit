@@ -64,3 +64,20 @@ To remotely install the rootkit, run `./struts2.py <hostname of target>`.
 If you want to install the rootkit locally (without root), run `make install`.
 
 If you are already root, you can simply run `make && sudo insmod rootkit.ko`.
+
+## Rootkit details
+
+To give any process root permissions, we use `commit_creds(prepare_kernel_cred(NULL))`,
+which is intended to be used for kernel userspace daemons. It's a pretty
+well-known backdoor method which sets the calling process's UID to 0.
+
+To hide the module from the kernel module list, we simply remove it from
+the linked list of all kernel modules. Luckily, the list is a doubly
+linked list, so we don't need the head node's address.
+
+To hide files on the filesystem, we replaced the callback that the kernel
+uses to read files in the `getdents` syscall, which is what `ls` uses to
+read the files within a directory. To inject our hook into the kernel, we
+modify the file ops table for any files opened, then create a trampoline
+to wrap the original callback, and skipping any files with a name matching
+the list of hidden files.
