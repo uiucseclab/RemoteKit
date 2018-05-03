@@ -81,3 +81,18 @@ read the files within a directory. To inject our hook into the kernel, we
 modify the file ops table for any files opened, then create a trampoline
 to wrap the original callback, and skipping any files with a name matching
 the list of hidden files.
+
+To send the Rootkit source code, we first tar the code and sent separate packets, 
+which does not exceed 2KB to the target machine that runs Tomcat with Struts 2.
+Using a vulnerability found in Multipart parser in Apache Struts 2, we write 
+the code into /dev/shm, and compile the rootkit.
+
+To install the rootkit without root privilege, we use DirtyCOW exploit, where 
+a race condition in Linux kernel enables write operation to those protected files 
+with setuid bit. In this case, we created a payload to backup the /usr/bin/passwd 
+and overwrite it with the compilation and the installation of the rootkit, along 
+with the code to finally recover /usr/bin/passwd.
+
+## Video demo
+
+[Here](http://dsun18.web.engr.illinois.edu/cs460rootkit.mp4) is the video demo of the Rootkit.
